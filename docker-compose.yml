@@ -1,0 +1,160 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aihub
+      POSTGRES_USER: aihub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aihub -d aihub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [management]
+
+  docker-proxy-ro:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      INFO: 1
+      SYSTEM: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [management]
+
+  docker-proxy-rw:
+    image: tecnativa/docker-socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      INFO: 1
+      POST: 1
+      AUTH: 0
+      BUILD: 0
+      EXEC: 0
+      SECRETS: 0
+      SWARM: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [management]
+
+  buildkit:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/moby/buildkit:latest
+    command: ["--addr", "tcp://0.0.0.0:1234"]
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - buildkit-cache:/var/lib/buildkit
+    networks: [management]
+
+  api:
+    build: .
+    image: aihub-cloud:local
+    restart: unless-stopped
+    environment:
+      MODE: api
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@aihub.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?Set APP_ENCRYPTION_KEY in .env}
+      DATA_ROOT: /var/lib/aihub/data
+      ROUTES_ROOT: /var/lib/aihub/routes
+      DOCKER_API_RO: http://docker-proxy-ro:2375
+    volumes:
+      - aihub-data:/var/lib/aihub/data
+      - traefik-routes:/var/lib/aihub/routes
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      db: { condition: service_healthy }
+      docker-proxy-ro: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks: [management]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.aihub.rule=Host(`${PLATFORM_HOST:-aihub.localhost}`) || Host(`192.168.31.220`) || Host(`192.168.31.45`) || Host(`192.168.31.100`) || Host(`100.80.191.74`)
+      - traefik.http.routers.aihub.entrypoints=web
+      - traefik.http.services.aihub.loadbalancer.server.port=8080
+
+  worker:
+    image: aihub-cloud:local
+    restart: unless-stopped
+    command: []
+    entrypoint: ["/usr/local/bin/aihub"]
+    environment:
+      MODE: worker
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@aihub.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?Set APP_ENCRYPTION_KEY in .env}
+      DATA_ROOT: /var/lib/aihub/data
+      ROUTES_ROOT: /var/lib/aihub/routes
+      BUILDKIT_ADDR: tcp://buildkit:1234
+      DOCKER_API: http://docker-proxy-rw:2375
+      BASE_DOMAIN: ${BASE_DOMAIN:-apps.localhost}
+      EDGE_PORT: ${EDGE_PORT:-12688}
+    volumes:
+      - aihub-data:/var/lib/aihub/data
+      - traefik-routes:/var/lib/aihub/routes
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      db: { condition: service_healthy }
+      api: { condition: service_healthy }
+      buildkit: { condition: service_started }
+      docker-proxy-rw: { condition: service_started }
+    networks: [management]
+    container_name: aihub-worker
+
+  edge:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/traefik:v3.6
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://docker-proxy-ro:2375
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --api.dashboard=false
+      - --log.level=INFO
+    ports:
+      - "192.168.31.220:${EDGE_PORT:-12688}:80"
+      - "192.168.31.45:${EDGE_PORT:-12688}:80"
+      - "192.168.31.100:${EDGE_PORT:-12688}:80"
+      - "100.80.191.74:${EDGE_PORT:-12688}:80"
+    environment:
+      DOCKER_API_VERSION: "1.44"
+    volumes:
+      - traefik-routes:/etc/traefik/dynamic:ro
+    depends_on: [docker-proxy-ro]
+    networks: [management]
+    container_name: aihub-edge
+
+volumes:
+  postgres-data:
+  aihub-data:
+  buildkit-cache:
+  traefik-routes:
+
+networks:
+  management:
+    name: aihub-management
+    internal: false

@@ -1,0 +1,5 @@
+name: python-demo
+web:
+  port: 8080
+  command: python app.py
+  healthPath: /health

@@ -1,0 +1,5 @@
+name: node-demo
+web:
+  port: 3000
+  command: npm start
+  healthPath: /health
